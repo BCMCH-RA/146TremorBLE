@@ -119,9 +119,9 @@
 //     not the full 200Hz log -- the full-rate data is captured on-device
 //     (PSRAM ring + optional TF card) and pulled on demand via XFER_*.
 //   - CSV download pulls the device's own authoritative CSV buffer over
-//     XFER_DATA, rather than the browser reconstructing a file from
-//     whatever it happened to receive live. More robust against any
-//     dropped BLE notifications during the live preview.
+//     XFER_DATA. Each transfer notification contains a 4-byte CSV offset
+//     followed by CSV bytes, and the browser ACKs each chunk. This makes the
+//     file transfer recoverable if a BLE notification is dropped.
 //   - CMD characteristic takes UTF-8 text commands ("start_imu_rec" etc.),
 //     not single command bytes.
 // ============================================================================
@@ -131,7 +131,7 @@ const CHAR_CMD_UUID    = '6f2a0002-9b1e-4c7a-8b2a-9f7e6a2b0000'; // write, text
 const CHAR_STATUS_UUID = '6f2a0003-9b1e-4c7a-8b2a-9f7e6a2b0000'; // read, JSON
 const CHAR_TIME_UUID   = '6f2a0004-9b1e-4c7a-8b2a-9f7e6a2b0000'; // write, 8B LE epoch-ms
 const CHAR_XFER_CTRL_UUID = '6f2a0005-9b1e-4c7a-8b2a-9f7e6a2b0000'; // write
-const CHAR_XFER_DATA_UUID = '6f2a0006-9b1e-4c7a-8b2a-9f7e6a2b0000'; // notify, raw CSV bytes
+const CHAR_XFER_DATA_UUID = '6f2a0006-9b1e-4c7a-8b2a-9f7e6a2b0000'; // notify, offset + CSV bytes
 const CHAR_XFER_INFO_UUID = '6f2a0007-9b1e-4c7a-8b2a-9f7e6a2b0000'; // read, 4B LE uint32 total bytes
 
 let device = null, server = null;
@@ -163,6 +163,9 @@ let xferActive = false;
 let xferTotal = 0;
 let xferChunks = [];
 let xferReceived = 0;
+let xferExpectedOffset = 0;
+let xferRetryTimer = null;
+const XFER_RETRY_TIMEOUT_MS = 2500;
 
 const el = (id) => document.getElementById(id);
 const statusDot = el('statusDot'), statusText = el('statusText');
@@ -402,14 +405,26 @@ function releaseXferWakeLock() {
   }
 }
 
-function resetXferStallTimer() {
-  if (xferStallTimer) clearTimeout(xferStallTimer);
-  xferStallTimer = setTimeout(() => {
-    log(`Download stalled: no data received for ${XFER_STALL_TIMEOUT_MS / 1000}s ` +
-        `(got ${xferReceived.toLocaleString()} of ${xferTotal.toLocaleString()} bytes). ` +
-        `Giving up -- check the device is still connected and in range, then try again.`);
-    finishCsvDownload(false);
-  }, XFER_STALL_TIMEOUT_MS);
+function clearXferRetryTimer() {
+  if (xferRetryTimer) {
+    clearTimeout(xferRetryTimer);
+    xferRetryTimer = null;
+  }
+}
+
+function armXferRetryTimer() {
+  clearXferRetryTimer();
+  xferRetryTimer = setTimeout(async () => {
+    if (!xferActive) return;
+    log(`No CSV chunk received for ${XFER_RETRY_TIMEOUT_MS / 1000}s -- requesting resend at offset ${xferExpectedOffset.toLocaleString()}...`);
+    try {
+      await gattOp(() => charXferCtrl.writeValueWithoutResponse(new Uint8Array([3])));
+      armXferRetryTimer();
+    } catch (e) {
+      log(`Retry request failed: ${e}`);
+      finishCsvDownload(false);
+    }
+  }, XFER_RETRY_TIMEOUT_MS);
 }
 
 async function startCsvDownload() {
@@ -418,6 +433,8 @@ async function startCsvDownload() {
     xferChunks = [];
     xferReceived = 0;
     xferTotal = 0;
+    xferExpectedOffset = 0;
+    clearXferRetryTimer();
     xferActive = true;
     btnDownload.disabled = true;
     progressWrap.classList.add('active');
@@ -471,7 +488,7 @@ async function startCsvDownload() {
     }
 
     log(`Downloading ${xferTotal.toLocaleString()} bytes from device -- keep this tab open and the screen on, this can take under a minute for a large buffer...`);
-    resetXferStallTimer();
+    armXferRetryTimer();
   } catch (e) {
     log(`Download failed to start: ${e}`);
     finishCsvDownload(false);
@@ -480,69 +497,104 @@ async function startCsvDownload() {
 
 function onXferDataNotify(event) {
   if (!xferActive) return;
+
   const dv = event.target.value;
-  // Defensive: respect byteOffset/byteLength rather than assuming the
-  // DataView spans its entire underlying buffer.
-  const chunk = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength).slice();
+  const raw = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+
+  // Reliable-transfer packet:
+  //   bytes 0..3 = CSV offset (uint32 LE)
+  //   bytes 4..  = CSV data
+  if (raw.byteLength < 5) {
+    log(`Ignoring malformed CSV packet (${raw.byteLength} bytes).`);
+    return;
+  }
+
+  const packet = raw.slice();
+  const offset = new DataView(packet.buffer, packet.byteOffset, 4).getUint32(0, true);
+  const chunk = packet.slice(4);
+
+  // Duplicate packet after a lost ACK: ACK it again, but do not append it.
+  if (offset < xferExpectedOffset) {
+    log(`Duplicate CSV chunk at offset ${offset.toLocaleString()} -- ACKing again.`);
+    sendXferAck(xferExpectedOffset);
+    armXferRetryTimer();
+    return;
+  }
+
+  // A gap means the device or connection has lost synchronization. Do not
+  // silently append out-of-order data.
+  if (offset !== xferExpectedOffset) {
+    log(`ERROR: CSV offset gap: expected ${xferExpectedOffset.toLocaleString()}, received ${offset.toLocaleString()}. Requesting resend.`);
+    sendXferRetry();
+    return;
+  }
+
   xferChunks.push(chunk);
   xferReceived += chunk.byteLength;
-  resetXferStallTimer();
+  xferExpectedOffset += chunk.byteLength;
 
   const pct = xferTotal > 0 ? Math.min(100, (xferReceived / xferTotal) * 100) : 0;
   progressBar.style.width = `${pct}%`;
 
+  // ACK immediately so the ESP32 can send the next chunk.
+  sendXferAck(xferExpectedOffset);
+
   if (xferReceived >= xferTotal) {
+    clearXferRetryTimer();
     finishCsvDownload(true);
+  } else {
+    armXferRetryTimer();
   }
 }
 
-function finishCsvDownload(success) {
-  if (xferStallTimer) { clearTimeout(xferStallTimer); xferStallTimer = null; }
+async function sendXferAck(nextOffset) {
+  if (!charXferCtrl || !xferActive) return;
+  const ack = new Uint8Array(5);
+  ack[0] = 2;
+  new DataView(ack.buffer).setUint32(1, nextOffset, true);
+  try {
+    await gattOp(() => charXferCtrl.writeValueWithoutResponse(ack));
+  } catch (e) {
+    log(`CSV ACK failed: ${e}`);
+  }
+}
+
+async function sendXferRetry() {
+  if (!charXferCtrl || !xferActive) return;
+  try {
+    await gattOp(() => charXferCtrl.writeValueWithoutResponse(new Uint8Array([3])));
+  } catch (e) {
+    log(`CSV resend request failed: ${e}`);
+  }
+}
+
+async function finishCsvDownload(success) {
+  clearXferRetryTimer();
   releaseXferWakeLock();
   xferActive = false;
   progressWrap.classList.remove('active');
   btnDownload.disabled = false;
 
   if (success && xferChunks.length > 0) {
-    // Build the file only from the exact number of bytes reported by the
-    // device. This also protects against a final BLE notification containing
-    // more bytes than expected.
-    const parts = [];
-    let remaining = xferTotal;
-
-    for (const chunk of xferChunks) {
-      if (remaining <= 0) break;
-      const take = Math.min(chunk.byteLength, remaining);
-      parts.push(take === chunk.byteLength ? chunk : chunk.slice(0, take));
-      remaining -= take;
-    }
-
-    const receivedExact = xferTotal - remaining;
-
-    if (receivedExact !== xferTotal) {
-      log(`ERROR: CSV transfer incomplete (${receivedExact.toLocaleString()} of ${xferTotal.toLocaleString()} bytes). No file was saved.`);
+    if (xferReceived !== xferTotal || xferExpectedOffset !== xferTotal) {
+      log(`ERROR: CSV transfer incomplete (${xferReceived.toLocaleString()} of ${xferTotal.toLocaleString()} bytes). No file was saved.`);
     } else {
-      const blob = new Blob(parts, { type: 'text/csv;charset=utf-8' });
+      const blob = new Blob(xferChunks, { type: 'text/csv;charset=utf-8' });
       const ts = new Date().toISOString().replace(/[:.]/g, '-');
       const filename = `bcmch_tremor_${ts}.csv`;
 
-      // Prefer the native Save dialog where supported. This is more reliable
-      // than a synthetic <a>.click() on some desktop browser configurations.
       let saved = false;
       if ('showSaveFilePicker' in window) {
         try {
           const handle = await window.showSaveFilePicker({
             suggestedName: filename,
-            types: [{
-              description: 'CSV file',
-              accept: { 'text/csv': ['.csv'] }
-            }]
+            types: [{ description: 'CSV file', accept: { 'text/csv': ['.csv'] } }]
           });
           const writable = await handle.createWritable();
           await writable.write(blob);
           await writable.close();
           saved = true;
-          log(`CSV saved successfully: ${filename} (${receivedExact.toLocaleString()} bytes).`);
+          log(`CSV saved successfully: ${filename} (${xferReceived.toLocaleString()} bytes).`);
         } catch (e) {
           if (e && e.name === 'AbortError') {
             log('CSV save cancelled by user.');
@@ -559,23 +611,22 @@ function finishCsvDownload(success) {
         a.download = filename;
         a.style.display = 'none';
         document.body.appendChild(a);
-
-        // Give the browser a real event-loop turn before revoking the object
-        // URL. Immediate revoke can prevent downloads in some configurations.
         a.click();
         setTimeout(() => {
           URL.revokeObjectURL(url);
           a.remove();
-        }, 1500);
-
-        log(`CSV download started: ${filename} (${receivedExact.toLocaleString()} bytes).`);
+        }, 2000);
+        log(`CSV download started: ${filename} (${xferReceived.toLocaleString()} bytes).`);
       }
     }
   }
+
   xferChunks = [];
   xferReceived = 0;
   xferTotal = 0;
-  pollStatus(); // refresh buffer size / button state now that xferActive is false again
+  xferExpectedOffset = 0;
+  clearXferRetryTimer();
+  pollStatus();
 }
 
 // ---- Init ----
