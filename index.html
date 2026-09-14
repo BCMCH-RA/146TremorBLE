@@ -204,7 +204,7 @@ function setRecordingUI(isRecording) {
 // ---- Connect flow ----
 btnConnect.addEventListener('click', async () => {
   if (!navigator.bluetooth) {
-    log('ERROR: Web Bluetooth not supported (use Chrome/Edge on desktop or Android -- not Safari/Firefox).');
+    log('ERROR: Web Bluetooth is unavailable in this browser. Use Chrome or Edge (desktop/Android); Firefox and Safari are not supported for this app.');
     return;
   }
   try {
@@ -504,19 +504,72 @@ function finishCsvDownload(success) {
   btnDownload.disabled = false;
 
   if (success && xferChunks.length > 0) {
-    const blob = new Blob(xferChunks, { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    a.href = url;
-    a.download = `bcmch_tremor_${ts}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    log(`Downloaded ${xferReceived.toLocaleString()} bytes as CSV (device reported ${xferTotal.toLocaleString()}).`);
-    if (xferReceived !== xferTotal) {
-      log(`NOTE: received byte count doesn't match what the device reported -- file may be incomplete. Try Download again.`);
+    // Build the file only from the exact number of bytes reported by the
+    // device. This also protects against a final BLE notification containing
+    // more bytes than expected.
+    const parts = [];
+    let remaining = xferTotal;
+
+    for (const chunk of xferChunks) {
+      if (remaining <= 0) break;
+      const take = Math.min(chunk.byteLength, remaining);
+      parts.push(take === chunk.byteLength ? chunk : chunk.slice(0, take));
+      remaining -= take;
+    }
+
+    const receivedExact = xferTotal - remaining;
+
+    if (receivedExact !== xferTotal) {
+      log(`ERROR: CSV transfer incomplete (${receivedExact.toLocaleString()} of ${xferTotal.toLocaleString()} bytes). No file was saved.`);
+    } else {
+      const blob = new Blob(parts, { type: 'text/csv;charset=utf-8' });
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const filename = `bcmch_tremor_${ts}.csv`;
+
+      // Prefer the native Save dialog where supported. This is more reliable
+      // than a synthetic <a>.click() on some desktop browser configurations.
+      let saved = false;
+      if ('showSaveFilePicker' in window) {
+        try {
+          const handle = await window.showSaveFilePicker({
+            suggestedName: filename,
+            types: [{
+              description: 'CSV file',
+              accept: { 'text/csv': ['.csv'] }
+            }]
+          });
+          const writable = await handle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          saved = true;
+          log(`CSV saved successfully: ${filename} (${receivedExact.toLocaleString()} bytes).`);
+        } catch (e) {
+          if (e && e.name === 'AbortError') {
+            log('CSV save cancelled by user.');
+          } else {
+            log(`Native CSV save failed (${e}). Trying browser download fallback...`);
+          }
+        }
+      }
+
+      if (!saved) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+
+        // Give the browser a real event-loop turn before revoking the object
+        // URL. Immediate revoke can prevent downloads in some configurations.
+        a.click();
+        setTimeout(() => {
+          URL.revokeObjectURL(url);
+          a.remove();
+        }, 1500);
+
+        log(`CSV download started: ${filename} (${receivedExact.toLocaleString()} bytes).`);
+      }
     }
   }
   xferChunks = [];
@@ -529,7 +582,7 @@ function finishCsvDownload(success) {
 setConnectedUI(false);
 setRecordingUI(false);
 log('Ready. Click "Connect device" to pair over Web Bluetooth.');
-log('Note: Web Bluetooth requires HTTPS (or localhost) and Chrome/Edge - not supported in Safari or Firefox.');
+log('Note: Web Bluetooth requires HTTPS (or localhost) and Chrome/Edge. Firefox and Safari are not supported.');
 
 // Chrome releases the screen wake lock automatically when a tab is
 // backgrounded and does not restore it on its own -- if the user comes
