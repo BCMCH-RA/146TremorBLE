@@ -61,7 +61,7 @@
 <body>
 
   <h1>BCMCH Tremor Monitor</h1>
-  <div class="subtitle">Web Bluetooth companion for the BCMCH Sensor Hub (v5.1.0 tremor firmware).</div>
+  <div class="subtitle">Web Bluetooth companion for the BCMCH Sensor Hub (v5.2.1 reliable CSV firmware).</div>
 
   <div class="panel">
     <div class="status-line">
@@ -165,7 +165,7 @@ let xferChunks = [];
 let xferReceived = 0;
 let xferExpectedOffset = 0;
 let xferRetryTimer = null;
-const XFER_RETRY_TIMEOUT_MS = 2500;
+const XFER_RETRY_TIMEOUT_MS = 1800;
 
 const el = (id) => document.getElementById(id);
 const statusDot = el('statusDot'), statusText = el('statusText');
@@ -418,7 +418,7 @@ function armXferRetryTimer() {
     if (!xferActive) return;
     log(`No CSV chunk received for ${XFER_RETRY_TIMEOUT_MS / 1000}s -- requesting resend at offset ${xferExpectedOffset.toLocaleString()}...`);
     try {
-      await gattOp(() => charXferCtrl.writeValueWithoutResponse(new Uint8Array([3])));
+      await gattOp(() => charXferCtrl.writeValue(new Uint8Array([3])));
       armXferRetryTimer();
     } catch (e) {
       log(`Retry request failed: ${e}`);
@@ -443,7 +443,7 @@ async function startCsvDownload() {
     await acquireXferWakeLock();
 
     log('Requesting CSV pull (XFER_CTRL=1)...');
-    await gattOp(() => charXferCtrl.writeValueWithoutResponse(new Uint8Array([1])));
+    await gattOp(() => charXferCtrl.writeValue(new Uint8Array([1])));
 
     // Device sets XFER_INFO synchronously inside its write handler, but
     // there's no notification on that characteristic (it's read-only) --
@@ -553,7 +553,7 @@ async function sendXferAck(nextOffset) {
   ack[0] = 2;
   new DataView(ack.buffer).setUint32(1, nextOffset, true);
   try {
-    await gattOp(() => charXferCtrl.writeValueWithoutResponse(ack));
+    await gattOp(() => charXferCtrl.writeValue(ack));
   } catch (e) {
     log(`CSV ACK failed: ${e}`);
   }
@@ -562,7 +562,7 @@ async function sendXferAck(nextOffset) {
 async function sendXferRetry() {
   if (!charXferCtrl || !xferActive) return;
   try {
-    await gattOp(() => charXferCtrl.writeValueWithoutResponse(new Uint8Array([3])));
+    await gattOp(() => charXferCtrl.writeValue(new Uint8Array([3])));
   } catch (e) {
     log(`CSV resend request failed: ${e}`);
   }
